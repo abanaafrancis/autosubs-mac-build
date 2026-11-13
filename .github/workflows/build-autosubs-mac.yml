@@ -1,0 +1,97 @@
+name: Build patched AutoSubs for Resolve 21.2 (Mac ARM)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-autosubs-mac.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-mac:
+    runs-on: macos-15
+    timeout-minutes: 110
+    env:
+      CFLAGS: '-U__ARM_FEATURE_MATMUL_INT8'
+      CXXFLAGS: '-U__ARM_FEATURE_MATMUL_INT8'
+      CMAKE_ARGS: '-DGGML_I8MM=OFF -DGGML_NATIVE=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3'
+      MACOSX_DEPLOYMENT_TARGET: '13.3'
+    steps:
+      - name: Get patched upstream source at pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch fix/resolve-21.1.2-loadfile --single-branch https://github.com/M4DMK/auto-subs.git source
+          cd source
+          git checkout --detach 861dbfb470dfb5d190f7154cd54d393ad560197b
+          test "$(git rev-parse HEAD)" = 861dbfb470dfb5d190f7154cd54d393ad560197b
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Check ARM Mac toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          cmake --version
+      - name: Install JavaScript dependencies
+        working-directory: source
+        run: |
+          npm ci --prefix Adobe-Extension
+          npm ci --prefix AutoSubs-App
+      - name: Download upstream ffmpeg
+        working-directory: source/AutoSubs-App/src-tauri
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p binaries
+          cd binaries
+          gh release download --repo tmoroney/ffmpeg-binaries --pattern ffmpeg-aarch64-apple-darwin.zip
+          unzip -jo ffmpeg-aarch64-apple-darwin.zip
+          chmod +x ffmpeg-aarch64-apple-darwin
+      - name: Disable signed updater artifact requirement
+        working-directory: source
+        run: |
+          node - <<'JS'
+          const fs=require('fs');
+          const p='AutoSubs-App/src-tauri/tauri.conf.json';
+          const x=JSON.parse(fs.readFileSync(p,'utf8'));
+          x.bundle.createUpdaterArtifacts=false;
+          fs.writeFileSync(p,JSON.stringify(x,null,2));
+          JS
+      - name: Build native Apple Silicon app
+        working-directory: source/AutoSubs-App
+        run: npm run build:mac:arm64
+      - name: Remove unrelated Adobe CEP setup from installer
+        working-directory: source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Mac-Package/Scripts/postinstall')
+          s=p.read_text()
+          assert '# Adobe Extension Installation' in s
+          p.write_text(s.split('# Adobe Extension Installation')[0]+'\nexit 0\n')
+          PY
+      - name: Create unsigned PKG
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p Mac-Package/Payload
+          cp -R AutoSubs-App/src-tauri/target/release/bundle/macos/AutoSubs.app Mac-Package/Payload/
+          chmod +x Mac-Package/Scripts/postinstall
+          pkgbuild --identifier com.tom-moroney.autosubs --version 3.11.0 \
+            --install-location /Applications \
+            --root Mac-Package/Payload \
+            --scripts Mac-Package/Scripts \
+            AutoSubs-Resolve-21.2-Mac-ARM-UNSIGNED.pkg
+          shasum -a 256 AutoSubs-Resolve-21.2-Mac-ARM-UNSIGNED.pkg > installer.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoSubs-Resolve-21.2-Mac-ARM-UNSIGNED
+          path: |
+            source/AutoSubs-Resolve-21.2-Mac-ARM-UNSIGNED.pkg
+            source/installer.sha256
+          retention-days: 7
+          if-no-files-found: error
